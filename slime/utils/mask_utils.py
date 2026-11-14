@@ -7,9 +7,11 @@ def get_response_lengths(loss_masks: list[list[int]]) -> list[int]:
 
 
 class MultiTurnLossMaskGenerator:
-    def __init__(self, tokenizer: AutoTokenizer, tokenizer_type: str = "qwen"):
+    def __init__(self, tokenizer: AutoTokenizer, tokenizer_type: str = "qwen", chat_template_kwargs: dict | None = None):
         self.tokenizer = tokenizer
         self.tokenizer_type = tokenizer_type
+        # Used by the qwen3_5 path, which renders with the same kwargs as rollout.
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.system_message_length = 0
         self.gen_token_length = 0
         if self.tokenizer_type in ("qwen", "qwen3"):
@@ -137,10 +139,43 @@ class MultiTurnLossMaskGenerator:
 
         return all_token_ids, all_loss_masks
 
+    def _render(self, messages: list[dict], tools: list[dict] = None, *, add_generation_prompt=False, tokenize=False):
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            return_dict=False,
+            **self.chat_template_kwargs,
+        )
+
+    def _generation_prompt(self) -> str:
+        """The text the template appends for a new assistant turn, with this generator's kwargs.
+
+        Rollout sampling starts after exactly this text, so the trained part of an assistant
+        turn starts after it too.
+        """
+        probe = [{"role": "user", "content": "FOR TESTING ONLY"}]
+        without = self._render(probe)
+        with_prompt = self._render(probe, add_generation_prompt=True)
+        if not with_prompt.startswith(without) or len(with_prompt) == len(without):
+            raise ValueError("The chat template's generation prompt is not an append to the conversation.")
+        return with_prompt[len(without) :]
+
     def gen_multi_turn_loss_mask_qwen3_5(
         self, messages: list[dict], tools: list[dict] = None
     ) -> tuple[list[int], list[int]]:
-        rendered_text = self.tokenizer.apply_chat_template(messages, tokenize=False, tools=tools, return_dict=False)
+        """Supervise each assistant turn exactly where rollout samples it.
+
+        The conversation is rendered once with the chat template kwargs the rollout uses. An
+        assistant turn is trained from after the generation prompt through `<|im_end|>`; the
+        newline the template writes after `<|im_end|>` is not sampled, so it is not trained.
+        A turn whose rendering does not start with the generation prompt (for example reasoning
+        rendered while thinking is disabled, or a template that drops the thinking of earlier
+        turns) cannot be what rollout sampled, and is refused. A message with
+        `step_loss_mask` other than 1 stays in the context and is not trained.
+        """
+        rendered_text = self._render(messages, tools)
         tokenized = self.tokenizer(rendered_text, add_special_tokens=False, return_offsets_mapping=True)
         token_ids = tokenized["input_ids"]
         offset_mapping = tokenized.get("offset_mapping")
@@ -150,9 +185,7 @@ class MultiTurnLossMaskGenerator:
                 "Qwen3.5 loss mask generation requires a fast tokenizer " "with `return_offsets_mapping` support."
             )
 
-        expected_token_ids = self.tokenizer.apply_chat_template(
-            messages, tokenize=True, tools=tools, return_dict=False
-        )
+        expected_token_ids = self._render(messages, tools, tokenize=True)
         if token_ids != expected_token_ids:
             raise ValueError(
                 "Qwen3.5 rendered text tokenization does not match "
@@ -160,13 +193,15 @@ class MultiTurnLossMaskGenerator:
             )
 
         assistant_header = "<|im_start|>assistant\n"
-        think_prefix = "<think>\n"
         end_marker = "<|im_end|>"
+        generation_prompt = self._generation_prompt()
+        if not generation_prompt.startswith(assistant_header):
+            raise ValueError(f"Unexpected generation prompt {generation_prompt!r} for a Qwen3.5 template.")
 
         char_mask = [0] * len(rendered_text)
         cursor = 0
 
-        for message in messages:
+        for index, message in enumerate(messages):
             if message["role"] != "assistant":
                 continue
 
@@ -174,25 +209,23 @@ class MultiTurnLossMaskGenerator:
             if header_pos < 0:
                 raise ValueError("Failed to locate assistant message in rendered Qwen3.5 chat template output.")
 
-            content_start = header_pos + len(assistant_header)
-            end_pos = rendered_text.find(end_marker, content_start)
+            end_pos = rendered_text.find(end_marker, header_pos + len(assistant_header))
             if end_pos < 0:
                 raise ValueError("Failed to locate <|im_end|> for assistant message in rendered text.")
-
             span_end = end_pos + len(end_marker)
-            if span_end < len(rendered_text) and rendered_text[span_end] == "\n":
-                span_end += 1
             cursor = span_end
 
             if message.get("step_loss_mask", 1) != 1:
                 continue
 
-            if rendered_text[content_start : content_start + len(think_prefix)] == think_prefix:
-                mask_start = content_start + len(think_prefix)
-            else:
-                mask_start = content_start
+            if not rendered_text.startswith(generation_prompt, header_pos):
+                rendered = rendered_text[header_pos : header_pos + len(generation_prompt)]
+                raise ValueError(
+                    f"Assistant message {index} renders as {rendered!r}, not after the generation prompt "
+                    f"{generation_prompt!r}: rollout could not have sampled it with these chat template kwargs."
+                )
 
-            for pos in range(mask_start, span_end):
+            for pos in range(header_pos + len(generation_prompt), span_end):
                 char_mask[pos] = 1
 
         char_mask_prefix_sum = [0]
@@ -204,7 +237,10 @@ class MultiTurnLossMaskGenerator:
             if end <= start:
                 loss_mask.append(0)
             else:
-                loss_mask.append(1 if char_mask_prefix_sum[end] - char_mask_prefix_sum[start] > 0 else 0)
+                covered = char_mask_prefix_sum[end] - char_mask_prefix_sum[start]
+                if 0 < covered < end - start:
+                    raise ValueError(f"Token at characters {start}-{end} straddles an assistant turn boundary.")
+                loss_mask.append(1 if covered else 0)
 
         return token_ids, loss_mask
 
