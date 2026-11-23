@@ -18,7 +18,7 @@ def check_reward_nonzero_std(args, samples: list[Sample | list[Sample]], **kwarg
 
 
 def check_reward_nonzero_std_with_fallback(args, samples: list[Sample], **kwargs):
-    """Prefer non-zero-std groups without triggering another sampling round."""
+    """Allow uniform groups as fallback after bounded resampling."""
 
     output = check_reward_nonzero_std(args, samples, **kwargs)
     output.keep_when_insufficient = True

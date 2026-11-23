@@ -495,6 +495,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "If this value is None, rollout_batch_size will be used as the default over_sampling_batch_size."
                 ),
             )
+            from slime.rollout.filter_hub.resampling import nonnegative_int
+
+            parser.add_argument(
+                "--max-extra-sampling-rounds",
+                type=nonnegative_int,
+                default=3,
+                help="Extra draws before allowing uniform-reward groups to fill the batch.",
+            )
             parser.add_argument(
                 "--dynamic-sampling-filter-path",
                 type=str,

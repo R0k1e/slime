@@ -16,7 +16,8 @@ from slime.backends.sglang_utils.server_control import abort_servers_until_idle,
 from slime.data.transport import discard_rollout_group, publish_rollout_async
 from slime.observability.trace_utils import build_sglang_meta_trace_attrs, trace_function, trace_span
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput, finalize_rollout_groups
-from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, should_drop_dynamic_filter_output
+from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+from slime.rollout.filter_hub.resampling import Resampling
 from slime.rollout.sample_hooks import apply_rollout_sample_hooks
 from slime.utils.async_utils import AsyncPacer, run
 from slime.utils.data import Dataset
@@ -527,13 +528,30 @@ async def generate_rollout_async(
     keep_all_samples = args.rollout_all_samples_process_path is not None
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
+    resampling = Resampling(args)
+
+    async def accept(group):
+        if args.rollout_data_transport == "straw" and not keep_all_samples:
+            group = await publish_rollout_async(group, args, rollout_id, group=True, controller=controller)
+        data.append(group)
+        pbar.update(args.n_samples_per_prompt)
+
     while len(data) < target_data_size:
+        fallback = resampling.fill(state.remaining_batch_size)
+        state.remaining_batch_size += len(fallback)
+        for group in fallback:
+            await accept(group)
+        if len(data) == target_data_size:
+            break
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
             if hasattr(reader, "get_samples_async"):
                 samples = await reader.get_samples_async(args.over_sampling_batch_size)
             else:
                 samples = data_source(args.over_sampling_batch_size)
+            if not samples:
+                raise RuntimeError("data source produced no groups before the rollout target")
+            resampling.on_draw(len(samples))
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish
@@ -554,11 +572,10 @@ async def generate_rollout_async(
 
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             metric_gatherer.on_group_completed(dynamic_filter_output)
-            if should_drop_dynamic_filter_output(
-                dynamic_filter_output,
-                remaining_batch_size=state.remaining_batch_size,
-                target_data_size=target_data_size,
-            ):
+            if not dynamic_filter_output.keep:
+                state.remaining_batch_size -= 1
+                if resampling.defer(dynamic_filter_output, group):
+                    continue
                 if not keep_all_samples:
                     await asyncio.to_thread(
                         discard_rollout_group,
@@ -568,17 +585,19 @@ async def generate_rollout_async(
                         controller=controller,
                     )
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
-                state.remaining_batch_size -= 1
                 continue
 
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
-                sample = group[0][0] if isinstance(group[0], list) else group[0]
-                if args.rollout_data_transport == "straw" and not keep_all_samples:
-                    group = await publish_rollout_async(group, args, rollout_id, group=True, controller=controller)
-                data.append(group)
-                pbar.update(args.n_samples_per_prompt)
+                await accept(group)
+            elif not keep_all_samples:
+                await asyncio.to_thread(discard_rollout_group, group, args, "batch_full", controller=controller)
+
+    if not keep_all_samples:
+        for group in resampling.reserve:
+            await asyncio.to_thread(discard_rollout_group, group, args, "uniform_reward", controller=controller)
+    metrics = {**metric_gatherer.collect(), **resampling.metrics()}
 
     pbar.close()
     logger.info(
@@ -604,13 +623,13 @@ async def generate_rollout_async(
                 for group in data
             ]
             data = await publish_rollout_async(data, args, rollout_id)
-        output = RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect())
+        output = RolloutFnTrainOutput(samples=data, metrics=metrics)
     elif args.rollout_sample_filter_path is not None:
         # Preserve the calling thread/context of custom batch hooks.
-        output = finalize_rollout_groups(args, rollout_id, data, metric_gatherer.collect(), controller=controller)
+        output = finalize_rollout_groups(args, rollout_id, data, metrics, controller=controller)
     else:
         output = await asyncio.to_thread(
-            finalize_rollout_groups, args, rollout_id, data, metric_gatherer.collect(), controller=controller
+            finalize_rollout_groups, args, rollout_id, data, metrics, controller=controller
         )
     return output, aborted_samples
 
