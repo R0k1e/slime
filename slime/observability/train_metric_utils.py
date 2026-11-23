@@ -217,6 +217,22 @@ def log_rollout_data(
                                 num_rollouts_in_rollout=num_rollouts_in_rollout,
                                 dp_size=dp_world,
                             )
+                            # Reuse the loss-mask and distributed weighting of the mean.
+                            # Zero has its own bucket to expose uniform-reward fallbacks.
+                            bins = {
+                                "below_minus_one": tensor < -1,
+                                "minus_one_to_zero": (tensor >= -1) & (tensor < 0),
+                                "zero": tensor == 0,
+                                "zero_to_one": (tensor > 0) & (tensor <= 1),
+                                "above_one": tensor > 1,
+                            }
+                            for label, mask in bins.items():
+                                log_dict[f"advantage_distribution/{label}"] = rollout_log_metric_contribution(
+                                    sum_of_sample_mean(mask.float()).item(),
+                                    cp_size=cp_size,
+                                    num_rollouts_in_rollout=num_rollouts_in_rollout,
+                                    dp_size=dp_world,
+                                )
                         continue
                     per_rank_sum = tensor.mean() * cp_size * count
                     sum_value = per_rank_sum.item()
