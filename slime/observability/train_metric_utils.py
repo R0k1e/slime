@@ -210,6 +210,13 @@ def log_rollout_data(
                             dp_size=dp_world,
                         )
                         log_dict[key] = (sum_value, count)
+                        if key == "advantages":
+                            log_dict["advantages_second_moment"] = rollout_log_metric_contribution(
+                                sum_of_sample_mean(tensor.square()).item(),
+                                cp_size=cp_size,
+                                num_rollouts_in_rollout=num_rollouts_in_rollout,
+                                dp_size=dp_world,
+                            )
                         continue
                     per_rank_sum = tensor.mean() * cp_size * count
                     sum_value = per_rank_sum.item()

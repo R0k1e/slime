@@ -552,6 +552,9 @@ async def generate_rollout_async(
             if not samples:
                 raise RuntimeError("data source produced no groups before the rollout target")
             resampling.on_draw(len(samples))
+            for group in samples:
+                for sample in group:
+                    sample.metadata = {**(sample.metadata or {}), "rollout_id": rollout_id}
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish

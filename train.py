@@ -1,13 +1,24 @@
 import logging
+from time import monotonic
 
 import ray
 
 from slime.data.checkpoint import save_checkpoint
-from slime.observability.logging_utils import configure_logger, finish_tracking, init_tracking
+from slime.observability.logging_utils import configure_logger, finish_tracking, init_tracking, log
+from slime.observability.metric_utils import compute_rollout_step
 from slime.ray.placement_group import create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.cleanup import Cleanup
 from slime.utils.misc import should_run_periodic_action
+
+
+def log_step_phases(args, rollout_id, rollout, training, weight_update):
+    log(args, {
+        "rollout/step": compute_rollout_step(args, rollout_id),
+        "rollout/phase_seconds/rollout": rollout,
+        "rollout/phase_seconds/training": training,
+        "rollout/phase_seconds/weight_update": weight_update,
+    }, step_key="rollout/step")
 
 
 def train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan):
@@ -48,7 +59,9 @@ def train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
             ray.get(rollout_manager.eval.remote(rollout_id))
 
+        started = monotonic()
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+        rollout_seconds = monotonic() - started
 
         if args.offload_rollout:
             ray.get(rollout_manager.offload.remote())
@@ -56,6 +69,7 @@ def train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan):
         if release_train:
             actor_model.create()
 
+        started = monotonic()
         actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
         if args.use_critic:
             value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
@@ -65,6 +79,8 @@ def train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan):
                 ray.get(value_refs)
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+
+        train_seconds = monotonic() - started
 
         # Runtime completion releases queue capacity, without claiming that the
         # model/optimizer or this data progress have a durable joint checkpoint.
@@ -87,7 +103,9 @@ def train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan):
         if args.offload_rollout and not release_train:
             ray.get(rollout_manager.onload_weights.remote())
         was_paused = ray.get(rollout_manager.pause_rollout_admission.remote())
+        started = monotonic()
         actor_model.update_weights()
+        log_step_phases(args, rollout_id, rollout_seconds, train_seconds, monotonic() - started)
         # Final evaluation uses the synchronized engines directly. Keep training
         # producers paused when no later rollout will consume their new work.
         if rollout_id + 1 < args.num_rollout:
