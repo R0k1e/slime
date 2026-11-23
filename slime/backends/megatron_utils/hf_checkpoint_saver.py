@@ -30,6 +30,7 @@ def save_hf_model_to_path(
     model_name: str | None = None,
     quantization_config: dict[str, Any] | None = None,
     progress_desc: str = "Save HF checkpoint",
+    inherit_frozen_weights: bool = True,
 ) -> None:
     """Save a Megatron model as an HF safetensors checkpoint."""
     path = Path(output_dir)
@@ -126,7 +127,7 @@ def save_hf_model_to_path(
             pending_write = _write_pending_chunk(writer, pending_write)
 
     pending_write = _write_pending_chunk(writer, pending_write)
-    _finalize_distributed_shards(path, writer.state(), hf_checkpoint)
+    _finalize_distributed_shards(path, writer.state(), hf_checkpoint if inherit_frozen_weights else None)
 
     if is_save_rank:
         logger.info("Successfully saved HuggingFace model to %s", path)
@@ -214,7 +215,7 @@ def _write_pending_chunk(
     return None
 
 
-def _finalize_distributed_shards(path: Path, local_state: dict[str, Any], base: Path) -> None:
+def _finalize_distributed_shards(path: Path, local_state: dict[str, Any], base: Path | None) -> None:
     import torch.distributed as dist
 
     if dist.is_available() and dist.is_initialized():
@@ -232,7 +233,8 @@ def _finalize_distributed_shards(path: Path, local_state: dict[str, Any], base: 
     if _is_global_rank_zero():
         try:
             _, index = _plan_shard_finalization(states)
-            _inherit_qwen_weights(base, path, index)
+            if base is not None:
+                _inherit_qwen_weights(base, path, index)
             with TemporaryDirectory(prefix=".hf-index-", dir=path) as directory:
                 index_path = Path(directory) / "model.safetensors.index.json"
                 index_path.write_text(json.dumps(index, indent=2))
