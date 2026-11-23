@@ -4,6 +4,7 @@ import math
 import os
 import shutil
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import torch
@@ -125,7 +126,7 @@ def save_hf_model_to_path(
             pending_write = _write_pending_chunk(writer, pending_write)
 
     pending_write = _write_pending_chunk(writer, pending_write)
-    _finalize_distributed_shards(path, writer.state())
+    _finalize_distributed_shards(path, writer.state(), hf_checkpoint)
 
     if is_save_rank:
         logger.info("Successfully saved HuggingFace model to %s", path)
@@ -213,7 +214,7 @@ def _write_pending_chunk(
     return None
 
 
-def _finalize_distributed_shards(path: Path, local_state: dict[str, Any]) -> None:
+def _finalize_distributed_shards(path: Path, local_state: dict[str, Any], base: Path) -> None:
     import torch.distributed as dist
 
     if dist.is_available() and dist.is_initialized():
@@ -222,10 +223,60 @@ def _finalize_distributed_shards(path: Path, local_state: dict[str, Any]) -> Non
     else:
         states = [local_state]
 
-    _finalize_local_shards(path, local_state, states, write_index=_is_global_rank_zero())
+    _finalize_local_shards(path, local_state, states, write_index=False)
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
+
+    index_error = None
+    if _is_global_rank_zero():
+        try:
+            _, index = _plan_shard_finalization(states)
+            _inherit_qwen_weights(base, path, index)
+            with TemporaryDirectory(prefix=".hf-index-", dir=path) as directory:
+                index_path = Path(directory) / "model.safetensors.index.json"
+                index_path.write_text(json.dumps(index, indent=2))
+                index_path.replace(path / index_path.name)
+        except Exception as exc:
+            index_error = repr(exc)
+    _raise_if_rank_zero_failed("publish HuggingFace weight index", index_error)
+
+
+def _inherit_qwen_weights(base: Path, path: Path, index: dict) -> None:
+    config = json.loads((path / "config.json").read_text())
+    if (
+        config.get("model_type") not in {"qwen3_5", "qwen3_5_moe"}
+        or not config.get("vision_config")
+        or config.get("language_model_only")
+    ):
+        return
+
+    from collections import defaultdict
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    index_path = base / "model.safetensors.index.json"
+    if index_path.is_file():
+        source = json.loads(index_path.read_text())["weight_map"]
+    else:
+        with safe_open(base / "model.safetensors", framework="pt", device="cpu") as reader:
+            source = dict.fromkeys(reader.keys(), "model.safetensors")
+    weight_map = index["weight_map"]
+    if not any(key.startswith("model.visual.") for key in source.keys() | weight_map.keys()):
+        raise ValueError(f"Qwen3.5 export advertises vision but has no vision tensors in {base}")
+
+    by_shard = defaultdict(list)
+    for key, shard in source.items():
+        if key.startswith(("model.visual.", "mtp.")) and key not in weight_map:
+            by_shard[shard].append(key)
+    for number, (shard, keys) in enumerate(by_shard.items(), start=1):
+        name = f"model-inherited-{number:05d}.safetensors"
+        with safe_open(base / shard, framework="pt", device="cpu") as reader:
+            tensors = {key: reader.get_tensor(key) for key in keys}
+        save_file(tensors, path / name, metadata={"format": "pt"})
+        index["metadata"]["total_size"] += sum(tensor.nbytes for tensor in tensors.values())
+        weight_map.update(dict.fromkeys(keys, name))
+
 
 
 def _finalize_local_shards(
